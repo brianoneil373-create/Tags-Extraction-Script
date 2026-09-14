@@ -10,11 +10,13 @@ st.set_page_config(page_title="Bosta Tag Extractor", layout="wide")
 def clean_bidi_text(text: str) -> str:
     if not text:
         return ""
-    # Remove BiDi control characters
+    # Strip BiDi control characters
     text = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", text)
+    # Convert Arabic-Indic digits (٠-٩) to standard ASCII (0-9)
     arabic_digits = "٠١٢٣٤٥٦٧٨٩"
     ascii_digits = "0123456789"
-    return text.translate(str.maketrans(arabic_digits, ascii_digits))
+    text = text.translate(str.maketrans(arabic_digits, ascii_digits))
+    return unicodedata.normalize("NFKD", text)
 
 
 def extract_bosta_data(pdf_file):
@@ -43,41 +45,49 @@ def extract_bosta_data(pdf_file):
                     shipment_id_match.group(1) if shipment_id_match else ""
                 )
 
-                # 3. Direct Header Extraction for "مبلغ التحصيل"
+                # 3. COD Extraction Strategy
                 total = 0.0
                 financial_status = "Paid"
 
-                # Grab the line containing "مبلغ التحصيل" or "Cash Amount"
-                cod_line_match = re.search(
-                    r"(?:مبلغ التحصيل|Cash Amount|COD):?\s*([^\n]+)", text
-                )
+                # Join digit groupings split by commas/spaces (e.g., "1, 549" or "1,549" -> "1549")
+                normalized_text = re.sub(r"(\d+)\s*,\s*(\d+)", r"\1\2", text)
 
-                if cod_line_match:
-                    cod_val_str = cod_line_match.group(1).strip()
-
-                    if "لا يوجد" in cod_val_str or "Paid" in cod_val_str:
-                        total = 0.0
-                        financial_status = "Paid"
-                    else:
-                        # Normalize commas inside digits (e.g. converts "1, 549" or "1,549" to "1549")
-                        # This fixes the issue where 1,549 was getting split into 1 and 549!
-                        digits_combined = re.sub(
-                            r"(\d+)\s*,\s*(\d+)", r"\1\2", cod_val_str
-                        )
-                        price_match = re.search(
-                            r"(\d+(?:\.\d+)?)", digits_combined
-                        )
-
-                        if price_match:
-                            total = float(price_match.group(1))
-                            financial_status = (
-                                "Pending" if total > 0 else "Paid"
-                            )
+                # Check for explicit "No COD" / "Paid" indicators first
+                if "لا يوجد" in normalized_text:
+                    total = 0.0
+                    financial_status = "Paid"
                 else:
-                    # Fallback if line match isn't triggered
-                    if "لا يوجد" in text:
-                        total = 0.0
-                        financial_status = "Paid"
+                    # Look for currency matches: "999ج.م", "999 ج.م", "ج.م999", "1549 EGP", etc.
+                    cod_match = re.search(
+                        r"(\d+(?:\.\d+)?)\s*(?:ج\.?م|EGP)", normalized_text
+                    )
+                    if not cod_match:
+                        cod_match = re.search(
+                            r"(?:ج\.?م|EGP)\s*(\d+(?:\.\d+)?)", normalized_text
+                        )
+
+                    # Fallback: find any number on the same line as 'التحصيل' or 'مبلغ'
+                    if not cod_match:
+                        cod_line = re.search(
+                            r".*(?:التحصيل|مبلغ|COD).*", normalized_text
+                        )
+                        if cod_line:
+                            cod_match = re.search(
+                                r"(\d+(?:\.\d+)?)", cod_line.group(0)
+                            )
+
+                    if cod_match:
+                        try:
+                            val = float(cod_match.group(1))
+                            # Ignore shipment/order IDs accidentally caught as price
+                            if str(int(val)) not in [name, shipment_id]:
+                                total = val
+                                financial_status = (
+                                    "Pending" if total > 0 else "Paid"
+                                )
+                        except ValueError:
+                            total = 0.0
+                            financial_status = "Paid"
 
                 # 4. Extract Lineitem SKU & Quantity
                 skus_found = re.findall(
