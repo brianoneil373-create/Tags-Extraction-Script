@@ -1,7 +1,6 @@
 import re
 import pandas as pd
 import pdfplumber
-import streamlit as st
 
 def extract_bosta_data(pdf_file):
     rows = []
@@ -12,31 +11,42 @@ def extract_bosta_data(pdf_file):
             if not text:
                 continue
 
-            # 1. Extract Name (Order Reference number)
+            # 1. Extract Name (Order Reference number e.g. 120107)
             name_match = re.search(r'Order Reference:\s*trimize:#(\d+)', text)
             name = name_match.group(1) if name_match else ""
 
-            # 2. Extract Shipment ID (Tracking Number)
-            shipment_id_match = re.search(r'Tracking Number\s*\n.*?\n(\d+)', text)
+            # 2. Extract Shipment ID 
+            # In Bosta tags, the 9-10 digit Shipment ID appears directly before "Order Reference:"
+            shipment_id_match = re.search(r'(\d{9,10})\s*\n?\s*Order Reference:', text)
+            
+            # Fallback search if the layout order shifts slightly
             if not shipment_id_match:
-                shipment_id_match = re.search(r'(\d{9,12})\s*\nOrder Reference:', text)
+                shipment_id_match = re.search(r'Customer Notes:.*?\n\s*(\d{9,10})', text, re.DOTALL)
+                
             shipment_id = shipment_id_match.group(1) if shipment_id_match else ""
 
             # 3. Extract Financial Status & Total
-            cod_match = re.search(r'مبلغ التحصيل:\s*([^\n]+)', text)
-            financial_status = "Paid"
-            total = 0.0
+            # Look for numbers (including decimals like 899.1 or 1,549) anywhere near COD text
+            # If a numeric amount exists, it's Pending. If it contains "لا يوجد" or no numbers, it's Paid.
+            cod_section = ""
+            for line in text.split('\n'):
+                if "مبلغ" in line or "التحصيل" in line or "ج.م" in line:
+                    cod_section += " " + line
 
-            if cod_match:
-                raw_cod = cod_match.group(1).replace(',', '').strip()
-                # Find digits or decimal numbers in the COD text
-                num_match = re.search(r'(\d+(?:\.\d+)?)', raw_cod)
-                if num_match:
-                    financial_status = "Pending"
-                    total = float(num_match.group(1))
+            # Extract numbers/decimals, stripping commas (handles 1,549 or 899.1)
+            numbers = re.findall(r'(\d+(?:[\.,]\d+)?)', cod_section)
+            
+            # Clean commas out of numbers
+            clean_numbers = [n.replace(',', '') for n in numbers]
+
+            if clean_numbers and "لا يوجد" not in cod_section:
+                financial_status = "Pending"
+                total = float(clean_numbers[0])
+            else:
+                financial_status = "Paid"
+                total = 0.0
 
             # 4. Extract Lineitem SKU and Quantity
-            # Pattern extracts quantity 'x 1' and SKU inside brackets/parentheses '(TRZ-XXX-XXX)'
             skus_found = re.findall(r'x\s*(\d+)\s*\(?([A-Z0-9\-]+)\)?', text)
 
             if skus_found:
@@ -50,7 +60,6 @@ def extract_bosta_data(pdf_file):
                         "Shipment ID": shipment_id
                     })
             else:
-                # Fallback if SKU structure isn't matched
                 rows.append({
                     "Name": name,
                     "Financial Status": financial_status,
@@ -61,24 +70,3 @@ def extract_bosta_data(pdf_file):
                 })
 
     return pd.DataFrame(rows)
-
-# Streamlit User Interface
-st.title("Bosta Shipment Tag Extractor")
-
-uploaded_file = st.file_uploader("Upload Bosta PDF Airway Bills", type=["pdf"])
-
-if uploaded_file is not None:
-    df = extract_bosta_data(uploaded_file)
-    st.write("### Extracted Data Preview", df)
-
-    # Convert dataframe to Excel format for download
-    output_name = "bosta_extracted_data.xlsx"
-    df.to_excel(output_name, index=False)
-    
-    with open(output_name, "rb") as file:
-        st.download_button(
-            label="Download Excel File",
-            data=file,
-            file_name=output_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
