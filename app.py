@@ -46,11 +46,17 @@ def extract_bosta_data(pdf_file):
                     shipment_id_match.group(1) if shipment_id_match else ""
                 )
 
-                # 3. Geometric Crop for COD Amount
-                # Bosta's COD / Amount is always in the bottom-right or middle section.
-                # We search words on page to find "التحصيل" or "Cash" anchor coordinates:
+                # 3. Geometric Crop & Filtered COD Extraction
                 total = 0.0
                 financial_status = "Paid"
+
+                # Strip out YYYY-MM-DD or DD/MM/YYYY date strings from text first
+                text_no_dates = re.sub(
+                    r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}", "", full_text
+                )
+                text_no_dates = re.sub(
+                    r"\d{1,2}[-/.]\d{1,2}[-/.]\d{4}", "", text_no_dates
+                )
 
                 words = page.extract_words()
                 cod_anchors = [
@@ -64,7 +70,6 @@ def extract_bosta_data(pdf_file):
 
                 target_text = ""
                 if cod_anchors:
-                    # Take the first keyword found and crop a box around it (+/- 50pt Y, full width)
                     anchor = cod_anchors[0]
                     crop_box = (
                         0,
@@ -76,23 +81,33 @@ def extract_bosta_data(pdf_file):
                     target_text = clean_bidi_text(
                         cropped_page.extract_text() or ""
                     )
+                    # Strip dates from target cropped text
+                    target_text = re.sub(
+                        r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}", "", target_text
+                    )
                 else:
-                    target_text = full_text
+                    target_text = text_no_dates
 
-                # Extract numbers sitting directly near the COD keywords
+                # Extract numbers sitting in COD box
                 nums = re.findall(r"\b\d+(?:\.\d+)?\b", target_text)
-                # Filter out the order reference and shipment ID from candidate numbers
-                candidate_nums = [
-                    float(n)
-                    for n in nums
-                    if n not in [name, shipment_id] and float(n) < 50000
-                ]
+
+                # Filter out: IDs, 4-digit years (2020-2030), and values over 50,000
+                candidate_nums = []
+                for n in nums:
+                    val = float(n)
+                    # Ignore order name, shipment ID, and year digits like 2024-2030
+                    if (
+                        n != name
+                        and n != shipment_id
+                        and not (2020 <= val <= 2030)
+                        and val < 50000
+                    ):
+                        candidate_nums.append(val)
 
                 if "لا يوجد" in target_text or "Paid" in target_text:
                     total = 0.0
                     financial_status = "Paid"
                 elif candidate_nums:
-                    # The price is almost always the largest non-ID number in that row
                     total = max(candidate_nums)
                     financial_status = "Pending" if total > 0 else "Paid"
 
