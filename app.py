@@ -9,18 +9,15 @@ def clean_description(text):
     if not text:
         return ""
     
-    # 1. Strip curly braces, bullet points, and separator bars
-    text = re.sub(r'[\{\}\bullet|]', '', text)
+    # 1. Strip section markers and unwanted symbols/braces/bullets
+    text = re.sub(r'\|\s*وصف الشحنة|وصف الشحنة\s*\|', '', text)
+    text = re.sub(r'[\{\}\bullet\•]', '', text)
     
-    # 2. Remove Arabic letters and diacritics
-    text = re.sub(r'[\u0600-\u06FF]', '', text)
-    
-    # 3. If there is a closing parenthesis (e.g. end of SKU code), crop any stray trailing text after it
-    if ')' in text:
-        text = text[:text.rfind(')') + 1]
-        
-    # 4. Clean up trailing/leading whitespace and double spaces
+    # 2. Normalize whitespace
     text = re.sub(r'\s+', ' ', text).strip()
+    
+    # 3. Clean up stray punctuation at the very beginning or end
+    text = re.sub(r'^[^\w\(\)]+|[^\w\(\)]+$', '', text).strip()
     
     return text
 
@@ -45,7 +42,9 @@ def parse_bosta_pdf(pdf_file):
 
         # 3. COD / Collection Amount
         cod_amount = "0"
-        cod_match = re.search(r'ج\.م\s*([\d,]+)', text)
+        cod_match = re.search(r'مبلغ التحصيل:\s*([\d,]+(?:\.\d+)?)', text)
+        if not cod_match:
+            cod_match = re.search(r'ج\.م\s*([\d,]+(?:\.\d+)?)', text)
         if cod_match:
             cod_amount = cod_match.group(1).replace(',', '')
 
@@ -55,14 +54,20 @@ def parse_bosta_pdf(pdf_file):
         if phone_match:
             phone = phone_match.group(1)
 
-        # 5. Product Description
-        item_desc = None
+        # 5. Extract Product Description Block
+        # Grab lines containing SKU codes or item titles
         lines = text.split('\n')
+        desc_lines = []
         for line in lines:
-            if any(keyword in line for keyword in ["TRZ-", "Bundle", "Routine"]):
-                # Clean the extracted line before saving
-                item_desc = clean_description(line)
-                break
+            if any(k in line for k in ["TRZ-", "Bundle", "Routine", "Intimate", "Grooming", "شفرة", "جل", "غسول"]):
+                # Skip pure header lines
+                if "Customer Notes" in line or "Order Reference" in line:
+                    continue
+                cleaned = clean_description(line)
+                if cleaned and cleaned not in desc_lines:
+                    desc_lines.append(cleaned)
+
+        item_desc = " | ".join(desc_lines) if desc_lines else None
 
         records.append({
             "Page": idx,
