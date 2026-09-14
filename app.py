@@ -5,6 +5,25 @@ import streamlit as st
 
 st.set_page_config(page_title="Shipment Tag Reviewer", layout="wide")
 
+def clean_description(text):
+    if not text:
+        return ""
+    
+    # 1. Strip curly braces, bullet points, and separator bars
+    text = re.sub(r'[\{\}\bullet|]', '', text)
+    
+    # 2. Remove Arabic letters and diacritics
+    text = re.sub(r'[\u0600-\u06FF]', '', text)
+    
+    # 3. If there is a closing parenthesis (e.g. end of SKU code), crop any stray trailing text after it
+    if ')' in text:
+        text = text[:text.rfind(')') + 1]
+        
+    # 4. Clean up trailing/leading whitespace and double spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
 def parse_bosta_pdf(pdf_file):
     reader = pypdf.PdfReader(pdf_file)
     records = []
@@ -39,9 +58,10 @@ def parse_bosta_pdf(pdf_file):
         # 5. Product Description
         item_desc = None
         lines = text.split('\n')
-        for i, line in enumerate(lines):
-            if "TRZ-" in line or "Bundle" in line or "Routine" in line:
-                item_desc = line.strip()
+        for line in lines:
+            if any(keyword in line for keyword in ["TRZ-", "Bundle", "Routine"]):
+                # Clean the extracted line before saving
+                item_desc = clean_description(line)
                 break
 
         records.append({
