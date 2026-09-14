@@ -12,8 +12,9 @@ def extract_bosta_data(pdf_file):
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages:
                 text = page.extract_text() or ""
+                words = page.extract_words()
 
-                # 1. Extract Order Reference / Name
+                # 1. Extract Order Reference / Name (e.g. 120107)
                 name_match = re.search(r'Order Reference:\s*trimize:#(\d+)', text)
                 name = name_match.group(1) if name_match else ""
 
@@ -23,40 +24,45 @@ def extract_bosta_data(pdf_file):
                     shipment_id_match = re.search(r'\b(\d{9,10})\b', text)
                 shipment_id = shipment_id_match.group(1) if shipment_id_match else ""
 
-                # 3. Extract COD Amount / Financial Status via Table Extraction
+                # 3. Coordinate-Based COD Amount Extraction
+                # Find words on the page matching Arabic cash labels
                 total = 0.0
                 financial_status = "Paid"
+                
+                # Filter all words containing numeric/decimal values on the page
+                numeric_words = [w for w in words if re.search(r'^\d+(?:[\.,]\d+)?$', w['text'])]
+                
+                # Locate the vertical position (top/bottom) of Arabic COD keywords
+                cod_y_positions = [
+                    w['top'] for w in words 
+                    if any(kw in w['text'] for kw in ["مبلغ", "التحصيل", "الجام", "ج.م"])
+                ]
 
-                # Pull all structured tables from the tag page
-                tables = page.extract_tables() or []
-                found_cod = False
+                if cod_y_positions:
+                    # Look for numeric words sitting on the same horizontal line (within 15 vertical pixels)
+                    target_y = cod_y_positions[0]
+                    line_numbers = [
+                        w['text'] for w in numeric_words 
+                        if abs(w['top'] - target_y) < 15 and w['text'] not in [name, shipment_id]
+                    ]
+                    
+                    if line_numbers:
+                        clean_val = float(line_numbers[0].replace(',', ''))
+                        if clean_val > 0:
+                            total = clean_val
+                            financial_status = "Pending"
 
-                for table in tables:
-                    for row in table:
-                        row_text = " ".join([str(cell) for cell in row if cell])
-                        # Bosta labels cash amounts near COD / Cash / التحصيل / ج.م
-                        if any(kw in row_text for kw in ["مبلغ", "التحصيل", "ج.م", "COD", "Cash"]):
-                            # Extract all numbers from this table row
-                            nums = re.findall(r'(\d+(?:[\.,]\d+)?)', row_text)
-                            for num in nums:
-                                clean_num = float(num.replace(',', ''))
-                                # Exclude tracking ID and order reference from total
-                                if clean_num > 0 and num not in [name, shipment_id]:
-                                    total = clean_num
-                                    financial_status = "Pending"
-                                    found_cod = True
-                                    break
-                        if found_cod:
-                            break
-                    if found_cod:
-                        break
-
-                # Fallback: Search full page text if table extraction missed it
-                if not found_cod:
-                    cod_matches = re.findall(r'(\d+(?:\.\d+)?)\s*ج\.م', text)
-                    if cod_matches:
-                        total = float(cod_matches[0])
-                        financial_status = "Pending"
+                # Fallback: Search all extracted text for decimal prices (e.g., 999.00 or 899.5)
+                if total == 0.0:
+                    price_matches = re.findall(r'\b(\d{2,5}(?:\.\d{1,2})?)\b', text)
+                    for price in price_matches:
+                        if price not in [name, shipment_id]:
+                            val = float(price)
+                            # Exclude typical quantities/year digits
+                            if 20 < val < 50000:
+                                total = val
+                                financial_status = "Pending"
+                                break
 
                 # 4. Extract Lineitem SKU & Quantity
                 skus_found = re.findall(r'x\s*(\d+)\s*\(?([A-Z0-9\-]+)\)?', text)
@@ -88,8 +94,6 @@ def extract_bosta_data(pdf_file):
 
 # --- Streamlit UI ---
 st.title("Bosta Shipment Tag Extractor")
-st.write("Upload your Bosta PDF airway bills below.")
-
 uploaded_file = st.file_uploader("Upload Bosta PDF Airway Bills", type=["pdf"])
 
 if uploaded_file is not None:
@@ -110,5 +114,3 @@ if uploaded_file is not None:
                 file_name=output_name,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-    else:
-        st.warning("No data could be extracted from the uploaded PDF.")
