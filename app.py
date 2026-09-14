@@ -1,5 +1,4 @@
 import re
-import unicodedata
 import pandas as pd
 import pdfplumber
 import streamlit as st
@@ -16,110 +15,89 @@ def clean_bidi_text(text: str) -> str:
     return text.translate(str.maketrans(arabic_digits, ascii_digits))
 
 
+def parse_cod_from_text(text: str) -> float:
+    """Helper to extract clean COD price from a cell or text line."""
+    if not text:
+        return 0.0
+
+    text = clean_bidi_text(text)
+
+    if "لا يوجد" in text:
+        return 0.0
+
+    # Reunite numbers separated by commas/spaces (e.g. "1, 549" or "1,549" -> "1549")
+    text = re.sub(r"(\d+)\s*,\s*(\d+)", r"\1\2", text)
+
+    # Search for all number matches
+    matches = re.findall(r"\b\d+(?:\.\d+)?\b", text)
+
+    # Filter out 4-digit year ranges like 2020-2030
+    valid_nums = [
+        float(m) for m in matches if not (2020 <= float(m) <= 2030)
+    ]
+
+    return valid_nums[0] if valid_nums else 0.0
+
+
 def extract_bosta_data(pdf_file):
     rows = []
 
     try:
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages:
-                # 1. Full text for SKUs, Order Reference, and Shipment ID
                 raw_text = page.extract_text() or ""
-                text = clean_bidi_text(raw_text)
+                full_text = clean_bidi_text(raw_text)
 
-                name_match = re.search(r"trimize:#(\d+)", text)
+                # 1. Extract Order Reference Name
+                name_match = re.search(r"trimize:#(\d+)", full_text)
                 name = name_match.group(1) if name_match else ""
 
+                # 2. Extract Shipment ID / Tracking Number
                 shipment_id_match = re.search(
-                    r"Tracking Number\s*(\d+)", text
+                    r"Tracking Number\s*(\d+)", full_text
                 )
                 if not shipment_id_match:
                     shipment_id_match = re.search(
-                        r"(\d{8,11})\s*\n?\s*Order Reference:", text
+                        r"(\d{8,11})\s*\n?\s*Order Reference:", full_text
                     )
                 if not shipment_id_match:
-                    shipment_id_match = re.search(r"\b(\d{9,10})\b", text)
+                    shipment_id_match = re.search(
+                        r"\b(\d{9,10})\b", full_text
+                    )
                 shipment_id = (
                     shipment_id_match.group(1) if shipment_id_match else ""
                 )
 
-                # 2. Extract COD Amount via Word Coordinates (Spatial Proximity)
-                words = page.extract_words()
-                for w in words:
-                    w["text"] = clean_bidi_text(w["text"])
-
+                # 3. Extract COD using Table Cell Extraction
                 total = 0.0
-                financial_status = "Paid"
+                tables = page.extract_tables()
 
-                # Locate the anchor word 'التحصيل' or 'COD'
-                anchors = [
-                    w
-                    for w in words
-                    if any(
-                        kw in w["text"] for kw in ["التحصيل", "مبلغ", "Cash"]
-                    )
-                ]
+                # Search through extracted table cells for 'التحصيل' or 'مبلغ'
+                cod_found = False
+                for table in tables:
+                    for row in table:
+                        for cell in row:
+                            if cell and any(
+                                kw in cell
+                                for kw in ["التحصيل", "مبلغ", "Cash", "COD"]
+                            ):
+                                total = parse_cod_from_text(cell)
+                                cod_found = True
+                                break
+                        if cod_found:
+                            break
+                    if cod_found:
+                        break
 
-                if anchors:
-                    # Target the first anchor found (header COD box)
-                    anchor = anchors[0]
+                # Fallback if table structure wasn't detected on the page
+                if not cod_found:
+                    total = parse_cod_from_text(full_text)
 
-                    # Filter for words on the same horizontal band (+/- 15 points vertically)
-                    same_line_words = [
-                        w
-                        for w in words
-                        if abs(w["top"] - anchor["top"]) <= 15
-                    ]
+                financial_status = "Pending" if total > 0 else "Paid"
 
-                    # Sort words horizontally from left to right
-                    same_line_words = sorted(
-                        same_line_words, key=lambda x: x["x0"]
-                    )
-                    line_string = " ".join([w["text"] for w in same_line_words])
-
-                    # Glue numbers split by commas/spaces like "1, 549" or "1,549" -> "1549"
-                    line_string = re.sub(
-                        r"(\d+)\s*,\s*(\d+)", r"\1\2", line_string
-                    )
-
-                    if "لا يوجد" in line_string:
-                        total = 0.0
-                        financial_status = "Paid"
-                    else:
-                        # Extract all clean digit sequences on that exact line
-                        digit_matches = re.findall(r"\b\d+(?:\.\d+)?\b", line_string)
-                        
-                        # Exclude 4-digit years (2024-2030) or ID matches
-                        valid_nums = [
-                            float(n)
-                            for n in digit_matches
-                            if n not in [name, shipment_id]
-                            and not (2020 <= float(n) <= 2030)
-                        ]
-
-                        if valid_nums:
-                            total = valid_nums[0]  # First price number on that line
-                            financial_status = (
-                                "Pending" if total > 0 else "Paid"
-                            )
-                else:
-                    # General fallback across full page text
-                    clean_full = re.sub(r"(\d+)\s*,\s*(\d+)", r"\1\2", text)
-                    if "لا يوجد" in clean_full:
-                        total = 0.0
-                        financial_status = "Paid"
-                    else:
-                        cod_fallback = re.search(
-                            r"(\d+(?:\.\d+)?)\s*(?:ج\.?م|EGP)", clean_full
-                        )
-                        if cod_fallback:
-                            total = float(cod_fallback.group(1))
-                            financial_status = (
-                                "Pending" if total > 0 else "Paid"
-                            )
-
-                # 3. Lineitem SKU & Quantity Extraction
+                # 4. Extract Lineitem SKU & Quantity
                 skus_found = re.findall(
-                    r"x\s*(\d+)\s*\(?([A-Z0-9\-]+)\)?", text
+                    r"x\s*(\d+)\s*\(?([A-Z0-9\-]+)\)?", full_text
                 )
 
                 if skus_found:
