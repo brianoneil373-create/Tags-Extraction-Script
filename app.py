@@ -8,18 +8,12 @@ st.set_page_config(page_title="Bosta Tag Extractor", layout="wide")
 
 
 def clean_bidi_text(text: str) -> str:
-    """Removes invisible directional control characters and normalizes Unicode."""
     if not text:
         return ""
-    # Remove BiDi control chars (LRM, RLM, LRE, RLE, PDF, LRO, RLO, etc.)
     text = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", text)
-    # Convert Arabic-Indic digits (٠-٩) to standard ASCII digits (0-9)
     arabic_digits = "٠١٢٣٤٥٦٧٨٩"
     ascii_digits = "0123456789"
-    trans_table = str.maketrans(arabic_digits, ascii_digits)
-    text = text.translate(trans_table)
-    # Normalize unicode representations
-    return unicodedata.normalize("NFKD", text)
+    return text.translate(str.maketrans(arabic_digits, ascii_digits))
 
 
 def extract_bosta_data(pdf_file):
@@ -28,65 +22,83 @@ def extract_bosta_data(pdf_file):
     try:
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages:
-                raw_text = page.extract_text() or ""
-                # Normalize text to fix hidden BiDi marks and Arabic-Indic digits
-                text = clean_bidi_text(raw_text)
+                full_text = clean_bidi_text(page.extract_text() or "")
 
-                # 1. Extract Order Reference / Name (e.g. 120107)
-                name_match = re.search(r"Order Reference:\s*trimize:#(\d+)", text)
+                # 1. Order Reference / Name
+                name_match = re.search(
+                    r"Order Reference:\s*trimize:#(\d+)", full_text
+                )
+                if not name_match:
+                    name_match = re.search(r"trimize:#(\d+)", full_text)
                 name = name_match.group(1) if name_match else ""
 
-                # 2. Extract Shipment ID (Tracking Number)
-                shipment_id_match = re.search(r"Tracking Number\s*(\d+)", text)
+                # 2. Shipment ID
+                shipment_id_match = re.search(
+                    r"Tracking Number\s*(\d+)", full_text
+                )
                 if not shipment_id_match:
                     shipment_id_match = re.search(
-                        r"(\d{8,11})\s*\n?\s*Order Reference:", text
+                        r"(\d{8,11})\s*\n?\s*Order Reference:", full_text
                     )
                 if not shipment_id_match:
-                    shipment_id_match = re.search(r"\b(\d{9,10})\b", text)
+                    shipment_id_match = re.search(r"\b(\d{9,10})\b", full_text)
                 shipment_id = (
                     shipment_id_match.group(1) if shipment_id_match else ""
                 )
 
-                # 3. Robust COD Amount Extraction
+                # 3. Geometric Crop for COD Amount
+                # Bosta's COD / Amount is always in the bottom-right or middle section.
+                # We search words on page to find "التحصيل" or "Cash" anchor coordinates:
                 total = 0.0
                 financial_status = "Paid"
 
-                # Check if it's explicitly unpaid/paid by examining the COD context area
-                cod_line_match = re.search(
-                    r"(?:مبلغ التحصيل|Cash Amount|COD)[^\n]*",
-                    text,
-                    re.IGNORECASE,
-                )
-                cod_text = cod_line_match.group(0) if cod_line_match else text
+                words = page.extract_words()
+                cod_anchors = [
+                    w
+                    for w in words
+                    if any(
+                        kw in w["text"]
+                        for kw in ["التحصيل", "مبلغ", "Cash", "COD"]
+                    )
+                ]
 
-                if "لا يوجد" in cod_text and not re.search(r"\d+", cod_text):
+                target_text = ""
+                if cod_anchors:
+                    # Take the first keyword found and crop a box around it (+/- 50pt Y, full width)
+                    anchor = cod_anchors[0]
+                    crop_box = (
+                        0,
+                        max(0, anchor["top"] - 10),
+                        page.width,
+                        min(page.height, anchor["bottom"] + 40),
+                    )
+                    cropped_page = page.crop(crop_box)
+                    target_text = clean_bidi_text(
+                        cropped_page.extract_text() or ""
+                    )
+                else:
+                    target_text = full_text
+
+                # Extract numbers sitting directly near the COD keywords
+                nums = re.findall(r"\b\d+(?:\.\d+)?\b", target_text)
+                # Filter out the order reference and shipment ID from candidate numbers
+                candidate_nums = [
+                    float(n)
+                    for n in nums
+                    if n not in [name, shipment_id] and float(n) < 50000
+                ]
+
+                if "لا يوجد" in target_text or "Paid" in target_text:
                     total = 0.0
                     financial_status = "Paid"
-                else:
-                    # Match currency prefix patterns (e.g. "ج.م 1,549" or "1,549 ج.م" or "749ج.م")
-                    cod_match = re.search(
-                        r"(?:ج\.م|EGP)\s*([0-9,]+(?:\.[0-9]+)?)", text
-                    )
-                    if not cod_match:
-                        cod_match = re.search(
-                            r"([0-9,]+(?:\.[0-9]+)?)\s*(?:ج\.م|EGP)", text
-                        )
+                elif candidate_nums:
+                    # The price is almost always the largest non-ID number in that row
+                    total = max(candidate_nums)
+                    financial_status = "Pending" if total > 0 else "Paid"
 
-                    if cod_match:
-                        clean_str = cod_match.group(1).replace(",", "")
-                        try:
-                            total = float(clean_str)
-                            financial_status = (
-                                "Pending" if total > 0 else "Paid"
-                            )
-                        except ValueError:
-                            total = 0.0
-                            financial_status = "Paid"
-
-                # 4. Extract Lineitem SKU & Quantity
+                # 4. Extract SKUs
                 skus_found = re.findall(
-                    r"x\s*(\d+)\s*\(?([A-Z0-9\-]+)\)?", text
+                    r"x\s*(\d+)\s*\(?([A-Z0-9\-]+)\)?", full_text
                 )
 
                 if skus_found:
