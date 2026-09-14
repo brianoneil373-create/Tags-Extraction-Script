@@ -1,9 +1,6 @@
 import re
 import pandas as pd
 import pdfplumber
-import streamlit as st
-
-st.set_page_config(page_title="Bosta Tag Extractor", layout="wide")
 
 def extract_bosta_data(pdf_file):
     rows = []
@@ -18,27 +15,39 @@ def extract_bosta_data(pdf_file):
             name_match = re.search(r'Order Reference:\s*trimize:#(\d+)', text)
             name = name_match.group(1) if name_match else ""
 
-            # 2. Extract Shipment ID (9-10 digit tracking number directly above Order Reference)
+            # 2. Extract Shipment ID (9-10 digit tracking number)
             shipment_id_match = re.search(r'(\d{9,10})\s*\n?\s*Order Reference:', text)
             if not shipment_id_match:
                 shipment_id_match = re.search(r'Customer Notes:.*?\n\s*(\d{9,10})', text, re.DOTALL)
             shipment_id = shipment_id_match.group(1) if shipment_id_match else ""
 
-            # 3. Extract Financial Status & Total
-            cod_section = ""
-            for line in text.split('\n'):
-                if "مبلغ" in line or "التحصيل" in line or "ج.م" in line:
-                    cod_section += " " + line
+            # 3. Robust Financial Status & Total Extraction
+            # Bosta lists cash collection values formatted as numbers (e.g., 999, 899.1, 1,500.00)
+            # Search for COD values directly by isolating standalone numeric prices on the page
+            cod_matches = re.findall(r'(?:COD|Cash|Amount|Total)?\s*[:\.-]?\s*(\d+(?:[\.,]\d+)?)', text, re.IGNORECASE)
+            
+            # Filter extracted numbers to isolate reasonable COD total amounts 
+            # (Excluding Order Reference digits, Shipment IDs, and quantities)
+            valid_totals = []
+            for num in re.findall(r'\b\d+(?:[\.,]\d+)?\b', text):
+                clean_num_str = num.replace(',', '')
+                try:
+                    val = float(clean_num_str)
+                    # Ignore values that match Shipment ID or Order Reference
+                    if clean_num_str != shipment_id and clean_num_str != name:
+                        # Exclude small item quantities (1-10) unless it's explicitly a total
+                        if val > 10 or '.' in num:
+                            valid_totals.append(val)
+                except ValueError:
+                    continue
 
-            numbers = re.findall(r'(\d+(?:[\.,]\d+)?)', cod_section)
-            clean_numbers = [n.replace(',', '') for n in numbers]
-
-            if clean_numbers and "لا يوجد" not in cod_section:
-                financial_status = "Pending"
-                total = float(clean_numbers[0])
+            if valid_totals:
+                # The COD amount is typically the highest standalone price value on the tag
+                total = valid_totals[0]
+                financial_status = "Pending" if total > 0 else "Paid"
             else:
-                financial_status = "Paid"
                 total = 0.0
+                financial_status = "Paid"
 
             # 4. Extract Lineitem SKU and Quantity
             skus_found = re.findall(r'x\s*(\d+)\s*\(?([A-Z0-9\-]+)\)?', text)
@@ -64,27 +73,3 @@ def extract_bosta_data(pdf_file):
                 })
 
     return pd.DataFrame(rows)
-
-# --- Streamlit UI ---
-st.title("Bosta Shipment Tag Extractor")
-st.write("Upload your Bosta PDF airway bills below to generate your Excel summary.")
-
-uploaded_file = st.file_uploader("Upload Bosta PDF Airway Bills", type=["pdf"])
-
-if uploaded_file is not None:
-    with st.spinner("Processing PDF..."):
-        df = extract_bosta_data(uploaded_file)
-        
-    st.success("Extraction complete!")
-    st.dataframe(df, use_container_width=True)
-
-    output_name = "bosta_extracted_data.xlsx"
-    df.to_excel(output_name, index=False)
-    
-    with open(output_name, "rb") as file:
-        st.download_button(
-            label="Download Excel File",
-            data=file,
-            file_name=output_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
