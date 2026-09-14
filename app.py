@@ -10,6 +10,7 @@ st.set_page_config(page_title="Bosta Tag Extractor", layout="wide")
 def clean_bidi_text(text: str) -> str:
     if not text:
         return ""
+    # Remove BiDi control characters
     text = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", text)
     arabic_digits = "٠١٢٣٤٥٦٧٨٩"
     ascii_digits = "0123456789"
@@ -22,98 +23,65 @@ def extract_bosta_data(pdf_file):
     try:
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages:
-                full_text = clean_bidi_text(page.extract_text() or "")
+                text = clean_bidi_text(page.extract_text() or "")
 
                 # 1. Order Reference / Name
-                name_match = re.search(
-                    r"Order Reference:\s*trimize:#(\d+)", full_text
-                )
-                if not name_match:
-                    name_match = re.search(r"trimize:#(\d+)", full_text)
+                name_match = re.search(r"trimize:#(\d+)", text)
                 name = name_match.group(1) if name_match else ""
 
                 # 2. Shipment ID
                 shipment_id_match = re.search(
-                    r"Tracking Number\s*(\d+)", full_text
+                    r"Tracking Number\s*(\d+)", text
                 )
                 if not shipment_id_match:
                     shipment_id_match = re.search(
-                        r"(\d{8,11})\s*\n?\s*Order Reference:", full_text
+                        r"(\d{8,11})\s*\n?\s*Order Reference:", text
                     )
                 if not shipment_id_match:
-                    shipment_id_match = re.search(r"\b(\d{9,10})\b", full_text)
+                    shipment_id_match = re.search(r"\b(\d{9,10})\b", text)
                 shipment_id = (
                     shipment_id_match.group(1) if shipment_id_match else ""
                 )
 
-                # 3. Geometric Crop & Filtered COD Extraction
+                # 3. Direct Header Extraction for "مبلغ التحصيل"
                 total = 0.0
                 financial_status = "Paid"
 
-                # Strip out YYYY-MM-DD or DD/MM/YYYY date strings from text first
-                text_no_dates = re.sub(
-                    r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}", "", full_text
-                )
-                text_no_dates = re.sub(
-                    r"\d{1,2}[-/.]\d{1,2}[-/.]\d{4}", "", text_no_dates
+                # Grab the line containing "مبلغ التحصيل" or "Cash Amount"
+                cod_line_match = re.search(
+                    r"(?:مبلغ التحصيل|Cash Amount|COD):?\s*([^\n]+)", text
                 )
 
-                words = page.extract_words()
-                cod_anchors = [
-                    w
-                    for w in words
-                    if any(
-                        kw in w["text"]
-                        for kw in ["التحصيل", "مبلغ", "Cash", "COD"]
-                    )
-                ]
+                if cod_line_match:
+                    cod_val_str = cod_line_match.group(1).strip()
 
-                target_text = ""
-                if cod_anchors:
-                    anchor = cod_anchors[0]
-                    crop_box = (
-                        0,
-                        max(0, anchor["top"] - 10),
-                        page.width,
-                        min(page.height, anchor["bottom"] + 40),
-                    )
-                    cropped_page = page.crop(crop_box)
-                    target_text = clean_bidi_text(
-                        cropped_page.extract_text() or ""
-                    )
-                    # Strip dates from target cropped text
-                    target_text = re.sub(
-                        r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}", "", target_text
-                    )
+                    if "لا يوجد" in cod_val_str or "Paid" in cod_val_str:
+                        total = 0.0
+                        financial_status = "Paid"
+                    else:
+                        # Normalize commas inside digits (e.g. converts "1, 549" or "1,549" to "1549")
+                        # This fixes the issue where 1,549 was getting split into 1 and 549!
+                        digits_combined = re.sub(
+                            r"(\d+)\s*,\s*(\d+)", r"\1\2", cod_val_str
+                        )
+                        price_match = re.search(
+                            r"(\d+(?:\.\d+)?)", digits_combined
+                        )
+
+                        if price_match:
+                            total = float(price_match.group(1))
+                            financial_status = (
+                                "Pending" if total > 0 else "Paid"
+                            )
                 else:
-                    target_text = text_no_dates
+                    # Fallback if line match isn't triggered
+                    if "لا يوجد" in text:
+                        total = 0.0
+                        financial_status = "Paid"
 
-                # Extract numbers sitting in COD box
-                nums = re.findall(r"\b\d+(?:\.\d+)?\b", target_text)
-
-                # Filter out: IDs, 4-digit years (2020-2030), and values over 50,000
-                candidate_nums = []
-                for n in nums:
-                    val = float(n)
-                    # Ignore order name, shipment ID, and year digits like 2024-2030
-                    if (
-                        n != name
-                        and n != shipment_id
-                        and not (2020 <= val <= 2030)
-                        and val < 50000
-                    ):
-                        candidate_nums.append(val)
-
-                if "لا يوجد" in target_text or "Paid" in target_text:
-                    total = 0.0
-                    financial_status = "Paid"
-                elif candidate_nums:
-                    total = max(candidate_nums)
-                    financial_status = "Pending" if total > 0 else "Paid"
-
-                # 4. Extract SKUs
+                # 4. Extract Lineitem SKU & Quantity
                 skus_found = re.findall(
-                    r"x\s*(\d+)\s*\(?([A-Z0-9\-]+)\)?", full_text
+                    r"x\s*(\d+)\s*\(?([A-Z0-9\-]+)\)?", text
                 )
 
                 if skus_found:
