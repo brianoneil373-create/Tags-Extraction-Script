@@ -1,6 +1,9 @@
 import re
 import pandas as pd
 import pdfplumber
+import streamlit as st
+
+st.set_page_config(page_title="Bosta Tag Extractor", layout="wide")
 
 def extract_bosta_data(pdf_file):
     rows = []
@@ -15,28 +18,19 @@ def extract_bosta_data(pdf_file):
             name_match = re.search(r'Order Reference:\s*trimize:#(\d+)', text)
             name = name_match.group(1) if name_match else ""
 
-            # 2. Extract Shipment ID 
-            # In Bosta tags, the 9-10 digit Shipment ID appears directly before "Order Reference:"
+            # 2. Extract Shipment ID (9-10 digit tracking number directly above Order Reference)
             shipment_id_match = re.search(r'(\d{9,10})\s*\n?\s*Order Reference:', text)
-            
-            # Fallback search if the layout order shifts slightly
             if not shipment_id_match:
                 shipment_id_match = re.search(r'Customer Notes:.*?\n\s*(\d{9,10})', text, re.DOTALL)
-                
             shipment_id = shipment_id_match.group(1) if shipment_id_match else ""
 
             # 3. Extract Financial Status & Total
-            # Look for numbers (including decimals like 899.1 or 1,549) anywhere near COD text
-            # If a numeric amount exists, it's Pending. If it contains "لا يوجد" or no numbers, it's Paid.
             cod_section = ""
             for line in text.split('\n'):
                 if "مبلغ" in line or "التحصيل" in line or "ج.م" in line:
                     cod_section += " " + line
 
-            # Extract numbers/decimals, stripping commas (handles 1,549 or 899.1)
             numbers = re.findall(r'(\d+(?:[\.,]\d+)?)', cod_section)
-            
-            # Clean commas out of numbers
             clean_numbers = [n.replace(',', '') for n in numbers]
 
             if clean_numbers and "لا يوجد" not in cod_section:
@@ -70,3 +64,27 @@ def extract_bosta_data(pdf_file):
                 })
 
     return pd.DataFrame(rows)
+
+# --- Streamlit UI ---
+st.title("Bosta Shipment Tag Extractor")
+st.write("Upload your Bosta PDF airway bills below to generate your Excel summary.")
+
+uploaded_file = st.file_uploader("Upload Bosta PDF Airway Bills", type=["pdf"])
+
+if uploaded_file is not None:
+    with st.spinner("Processing PDF..."):
+        df = extract_bosta_data(uploaded_file)
+        
+    st.success("Extraction complete!")
+    st.dataframe(df, use_container_width=True)
+
+    output_name = "bosta_extracted_data.xlsx"
+    df.to_excel(output_name, index=False)
+    
+    with open(output_name, "rb") as file:
+        st.download_button(
+            label="Download Excel File",
+            data=file,
+            file_name=output_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
